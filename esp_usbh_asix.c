@@ -139,13 +139,35 @@ typedef struct {
      *
      * `recovering` keeps the flush's own CANCELED callbacks from
      * resubmitting mid-recovery, and from posting a second recovery.
-     * `halted` is whether the IN endpoints need clearing before the
-     * next start: clearing one that is not halted is itself an error
-     * ("EP command error: ESP_ERR_INVALID_STATE" at every bring-up).
+     * `in_halted` and `int_halted` are whether each IN endpoint needs
+     * clearing before its next start: clearing one that is not halted
+     * is itself an error ("EP command error: ESP_ERR_INVALID_STATE" at
+     * every bring-up, before b81adc5).
      */
     volatile bool recovering;
-    bool halted;
+    bool in_halted;
+    bool int_halted;
     uint32_t recoveries;
+
+    /*
+     * Bulk IN is queued only while the link is up.
+     *
+     * Queued with the cable out, or idle, the RX transfers came back
+     * with USB_TRANSFER_STATUS_ERROR every one to five seconds -- 17
+     * recoveries in a minute on the board, every one of them while the
+     * link was down or carrying nothing, and none in 90 s of streaming.
+     * With no link there is nothing to receive, so nothing is lost by
+     * not asking; asix_bulk_start() and asix_bulk_stop() follow the
+     * link, and the interrupt endpoint -- which is how link-up is
+     * learnt at all -- stays queued throughout.
+     *
+     * `rx_inflight` counts RX transfers submitted and not yet returned,
+     * so a start straight after a stop (a cable wiggled: link down and
+     * up 30 ms apart on the board) waits for the cancellations to come
+     * back instead of submitting a transfer that is still in flight.
+     */
+    bool bulk_on;
+    volatile int rx_inflight;
 } asix_t;
 
 /* ------------------------------------------------------------------ */
@@ -467,6 +489,9 @@ static esp_err_t ax88772a_hw_reset(asix_t *asix)
 /* Data path                                                           */
 /* ------------------------------------------------------------------ */
 
+static esp_err_t asix_bulk_start(asix_t *asix);
+static void asix_bulk_stop(asix_t *asix);
+
 static void asix_report_link(asix_t *asix, bool up)
 {
     if (asix->link_up == up) {
@@ -481,6 +506,18 @@ static void asix_report_link(asix_t *asix, bool up)
         asix_set_multicast(asix);
     } else {
         asix_mac_link_down(asix);
+    }
+
+    /* Receive follows the link: see bulk_on. Down before the stack is
+     * told, so nothing is queued on a link iot_eth thinks is gone; up
+     * before, so the first DHCP reply has somewhere to land. */
+    if (up) {
+        const esp_err_t err = asix_bulk_start(asix);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "receive could not start: %s", esp_err_to_name(err));
+        }
+    } else {
+        asix_bulk_stop(asix);
     }
 
     if (asix->mediator) {
@@ -513,12 +550,18 @@ static void asix_resubmit_in(asix_t *asix, usb_transfer_t *xfer)
     if (xfer->status == USB_TRANSFER_STATUS_CANCELED) {
         return;
     }
+    const bool bulk = (xfer->bEndpointAddress == asix->ep_in);
+    if (bulk && !asix->bulk_on) {
+        return;             /* the link went down; asix_bulk_stop() has it */
+    }
     esp_err_t err = ESP_OK;
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
+        if (bulk) asix->rx_inflight++;
         err = usb_host_transfer_submit(xfer);
         if (err == ESP_OK) {
             return;
         }
+        if (bulk) asix->rx_inflight--;
     }
     asix->recovering = true;
     const asix_cmd_t cmd = { .type = ASIX_CMD_RECOVER };
@@ -595,6 +638,7 @@ static void asix_deliver(asix_t *asix, const uint8_t *frame, uint16_t len)
 static void rx_cb(usb_transfer_t *xfer)
 {
     asix_t *asix = (asix_t *)xfer->context;
+    asix->rx_inflight--;    /* returned, whatever it says */
 
     if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
         goto resubmit;          /* asix_resubmit_in() sorts out which */
@@ -830,19 +874,33 @@ static esp_err_t asix_find_endpoints(asix_t *asix)
     return ESP_OK;
 }
 
-static esp_err_t asix_start_rx(asix_t *asix)
+/* Wait for every RX transfer to come back, for at most `ms`. */
+static bool asix_rx_drained(asix_t *asix, int ms)
 {
-    /* stop() and a recovery halt these endpoints; a halted endpoint
-     * refuses new transfers until cleared. NOT on a fresh device: a
-     * clear there fails, and logged two errors at every bring-up. */
-    if (asix->halted) {
-        usb_host_endpoint_clear(asix->dev, asix->ep_in);
-        if (asix->ep_int) {
-            usb_host_endpoint_clear(asix->dev, asix->ep_int);
+    for (int waited = 0; asix->rx_inflight > 0; waited += 5) {
+        if (waited >= ms) {
+            return false;
         }
-        asix->halted = false;
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
+    return true;
+}
 
+/* Queue the RX transfers. Only while the link is up; see bulk_on. */
+static esp_err_t asix_bulk_start(asix_t *asix)
+{
+    if (asix->bulk_on || !asix->attached || !asix->started) {
+        return ESP_OK;
+    }
+    if (!asix_rx_drained(asix, 100)) {
+        ESP_LOGW(TAG, "rx: %d transfer%s still out after a stop; starting anyway",
+                 asix->rx_inflight, asix->rx_inflight == 1 ? "" : "s");
+    }
+    if (asix->in_halted) {
+        usb_host_endpoint_clear(asix->dev, asix->ep_in);
+        asix->in_halted = false;
+    }
+    asix->bulk_on = true;
     for (int i = 0; i < ASIX_RX_XFER_COUNT; i++) {
         usb_transfer_t *xfer = asix->rx_xfer[i];
         xfer->device_handle = asix->dev;
@@ -851,10 +909,45 @@ static esp_err_t asix_start_rx(asix_t *asix)
         xfer->timeout_ms = 0;
         xfer->callback = rx_cb;
         xfer->context = asix;
-        ESP_RETURN_ON_ERROR(usb_host_transfer_submit(xfer), TAG, "rx submit");
+        asix->rx_inflight++;
+        const esp_err_t err = usb_host_transfer_submit(xfer);
+        if (err != ESP_OK) {
+            asix->rx_inflight--;
+            return err;
+        }
     }
+    return ESP_OK;
+}
 
+/* Take the RX transfers back. Halt, flush, and wait for the
+ * cancellations, which arrive on the event task. */
+static void asix_bulk_stop(asix_t *asix)
+{
+    if (!asix->bulk_on) {
+        return;
+    }
+    asix->bulk_on = false;
+    usb_host_endpoint_halt(asix->dev, asix->ep_in);
+    usb_host_endpoint_flush(asix->dev, asix->ep_in);
+    asix->in_halted = true;
+    if (!asix_rx_drained(asix, 100)) {
+        ESP_LOGW(TAG, "rx: %d transfer%s not returned after a flush",
+                 asix->rx_inflight, asix->rx_inflight == 1 ? "" : "s");
+    }
+}
+
+/*
+ * Start receiving: the interrupt endpoint always, for the link state,
+ * and bulk IN only if the link is already up -- otherwise the link-up
+ * report will start it.
+ */
+static esp_err_t asix_start_rx(asix_t *asix)
+{
     if (asix->ep_int) {
+        if (asix->int_halted) {
+            usb_host_endpoint_clear(asix->dev, asix->ep_int);
+            asix->int_halted = false;
+        }
         usb_transfer_t *xfer = asix->int_xfer;
         xfer->device_handle = asix->dev;
         xfer->bEndpointAddress = asix->ep_int;
@@ -864,11 +957,11 @@ static esp_err_t asix_start_rx(asix_t *asix)
         xfer->context = asix;
         ESP_RETURN_ON_ERROR(usb_host_transfer_submit(xfer), TAG, "int submit");
     } else {
-        /* No link notifications to wait for. */
+        /* No link notifications to wait for; this starts bulk too. */
         asix_report_link(asix, true);
     }
 
-    return ESP_OK;
+    return asix->link_up ? asix_bulk_start(asix) : ESP_OK;
 }
 
 static esp_err_t asix_open_device(asix_t *asix, uint8_t addr)
@@ -895,7 +988,10 @@ static esp_err_t asix_open_device(asix_t *asix, uint8_t addr)
     asix->dev = dev;
     asix->dev_addr = addr;
     asix->attached = true;      /* asix_ctrl() needs this set */
-    asix->halted = false;       /* a fresh device's endpoints are not */
+    asix->in_halted = false;    /* a fresh device's endpoints are not */
+    asix->int_halted = false;
+    asix->bulk_on = false;
+    asix->rx_inflight = 0;
     asix->recovering = false;
     asix->recoveries = 0;
 
@@ -963,11 +1059,10 @@ static void asix_close_device(asix_t *asix)
     asix_report_link(asix, false);
 
     /* Transfers are cancelled by the halt/flush pair before the buffers
-     * they point at are freed. */
-    if (asix->ep_in) {
-        usb_host_endpoint_halt(asix->dev, asix->ep_in);
-        usb_host_endpoint_flush(asix->dev, asix->ep_in);
-    }
+     * they point at are freed. Bulk IN is not in the list: the link
+     * report above stopped it if it was running, and halting an idle
+     * endpoint twice is one more logged error. */
+    asix_bulk_stop(asix);
     if (asix->ep_out) {
         usb_host_endpoint_halt(asix->dev, asix->ep_out);
         usb_host_endpoint_flush(asix->dev, asix->ep_out);
@@ -1044,9 +1139,9 @@ static void event_task(void *arg)
  * only the one that failed: which one it was is not carried in the
  * command, and restarting a healthy interrupt endpoint costs one poll.
  *
- * Halt, flush, and wait for the cancellations to come back -- the same
- * 50 ms asix_close_device() waits, for the same reason -- then clear
- * and resubmit through asix_start_rx(), exactly as a start does.
+ * Halt and flush both, wait for the cancellations to come back, then
+ * restart through asix_start_rx(), exactly as a start does -- which
+ * restarts bulk IN only if the link is up.
  */
 static void asix_recover_in(asix_t *asix)
 {
@@ -1054,13 +1149,12 @@ static void asix_recover_in(asix_t *asix)
         asix->recovering = false;
         return;
     }
-    usb_host_endpoint_halt(asix->dev, asix->ep_in);
-    usb_host_endpoint_flush(asix->dev, asix->ep_in);
+    asix_bulk_stop(asix);
     if (asix->ep_int) {
         usb_host_endpoint_halt(asix->dev, asix->ep_int);
         usb_host_endpoint_flush(asix->dev, asix->ep_int);
+        asix->int_halted = true;
     }
-    asix->halted = true;
     vTaskDelay(pdMS_TO_TICKS(50));
 
     asix->recovering = false;
@@ -1219,14 +1313,13 @@ static esp_err_t asix_stop(iot_eth_driver_t *driver)
     asix->started = false;
 
     if (asix->attached) {
-        asix_report_link(asix, false);
-        usb_host_endpoint_halt(asix->dev, asix->ep_in);
-        usb_host_endpoint_flush(asix->dev, asix->ep_in);
+        asix_report_link(asix, false);      /* stops bulk IN too */
+        asix_bulk_stop(asix);               /* in case the link was never up */
         if (asix->ep_int) {
             usb_host_endpoint_halt(asix->dev, asix->ep_int);
             usb_host_endpoint_flush(asix->dev, asix->ep_int);
+            asix->int_halted = true;
         }
-        asix->halted = true;
     }
 
     return ESP_OK;

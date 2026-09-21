@@ -16,6 +16,12 @@
 - Fix: two "EP command error" lines at every bring-up, from clearing
   endpoints that were never halted. Cleared only after a stop or a
   recovery now.
+- Bulk IN is queued only while the link is up. Left queued with the
+  cable out, or idle, RX transfers failed with a transfer error every
+  one to five seconds (17 recoveries in a minute on the board, none in
+  90 s of streaming). The interrupt endpoint stays queued throughout,
+  since it is how link-up is learnt. A start straight after a stop
+  waits for the stop's cancellations to return.
 
 - Initial driver for AX88772 / AX88772A / AX88772B, implementing
   `iot_eth_driver_t`.
