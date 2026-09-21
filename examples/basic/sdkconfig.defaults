@@ -1,0 +1,4 @@
+CONFIG_IDF_TARGET="esp32p4"
+# External hubs, so an adapter built into a hub is found.
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+CONFIG_USB_HOST_HUB_MULTI_LEVEL=y

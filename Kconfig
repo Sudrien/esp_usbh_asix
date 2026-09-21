@@ -1,0 +1,24 @@
+menu "ASIX USB Ethernet host driver"
+
+    config ASIX_RX_BUFFER_SIZE
+        int "RX transfer buffer size (bytes)"
+        default 2048
+        range 2048 16384
+        help
+            Size of each bulk IN transfer buffer. The chip is told the
+            matching maximum burst (RX_CTL MFB) so it never sends more
+            than one buffer holds: 2048, 4096, 8192 or 16384. Values
+            between those round down to the next one. Larger buffers let
+            the chip pack several frames per transfer, which helps
+            throughput at the cost of RAM.
+
+    config ASIX_RX_TRANSFER_COUNT
+        int "RX transfers kept in flight"
+        default 2
+        range 1 8
+        help
+            Number of bulk IN transfers submitted at once. Two keeps one
+            in flight while the other is being unpacked; more smooths
+            bursts at the cost of one RX buffer each.
+
+endmenu

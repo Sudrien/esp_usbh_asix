@@ -1,0 +1,20 @@
+version: "0.1.0"
+description: USB host Ethernet driver for ASIX AX88772, AX88772A and AX88772B
+url: https://github.com/Sudrien/esp_usbh_asix
+repository: https://github.com/Sudrien/esp_usbh_asix.git
+issues: https://github.com/Sudrien/esp_usbh_asix/issues
+license: Apache-2.0
+tags:
+  - usb
+  - usb_host
+  - ethernet
+  - asix
+targets:
+  - esp32s2
+  - esp32s3
+  - esp32p4
+dependencies:
+  idf: ">=5.4"
+  espressif/iot_eth:
+    version: "^1.1"
+    public: true
