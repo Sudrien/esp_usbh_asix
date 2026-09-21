@@ -10,15 +10,15 @@ so the netif glue, DHCP and everything above work unchanged.
 
 ## Status
 
-**Compiles; not yet run on hardware.** It builds cleanly for ESP32-P4
-against ESP-IDF v5.5.1 at `-Wall -Wextra`. No frame has moved through it
-on a real board yet. Treat it as a starting point until this line says
-otherwise.
+**Runs on one chip.** An AX88772A has carried real traffic on an
+ESP32-P4 (M5Stack Tab5, ESP-IDF v5.5.5): DHCP, a TLS audio stream for
+minutes, cable unplug and replug. The other two chips have still not
+been tried.
 
 | Chip     | VID:PID     | Chip code | Status |
 |----------|-------------|-----------|--------|
 | AX88772  | `0b95:7720` | `0x00`    | untested |
-| AX88772A | `0b95:772a` | `0x10`    | untested; first target |
+| AX88772A | `0b95:772a` | `0x10`    | works (ESP32-P4) |
 | AX88772B | `0b95:772b` | `0x20`    | untested |
 
 The AX88178/179 (gigabit) are a different command set and are not

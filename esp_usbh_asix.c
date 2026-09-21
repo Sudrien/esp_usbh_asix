@@ -33,6 +33,7 @@
  *     a component cannot assume it is the only user of the bus.
  */
 
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -78,6 +79,7 @@ typedef enum {
     ASIX_CMD_NEW_DEV,
     ASIX_CMD_DEV_GONE,
     ASIX_CMD_LINK,      /* Link change seen on the interrupt endpoint */
+    ASIX_CMD_RECOVER,   /* An IN transfer failed; its endpoint is halted */
 } asix_cmd_type_t;
 
 typedef struct {
@@ -125,6 +127,25 @@ typedef struct {
     bool attached;      /* Device open, endpoints known */
     bool started;       /* iot_eth has called start() */
     bool link_up;
+
+    /*
+     * IN-endpoint recovery. A transfer that ends in error leaves its
+     * endpoint HALTED -- the host stack does that itself -- and every
+     * submit after it fails with ESP_ERR_INVALID_STATE until the
+     * endpoint is cleared. The callbacks cannot clear it (endpoint
+     * commands are not for callback context), so they post
+     * ASIX_CMD_RECOVER and stop resubmitting; the worker halts, flushes,
+     * clears and starts the transfers again.
+     *
+     * `recovering` keeps the flush's own CANCELED callbacks from
+     * resubmitting mid-recovery, and from posting a second recovery.
+     * `halted` is whether the IN endpoints need clearing before the
+     * next start: clearing one that is not halted is itself an error
+     * ("EP command error: ESP_ERR_INVALID_STATE" at every bring-up).
+     */
+    volatile bool recovering;
+    bool halted;
+    uint32_t recoveries;
 } asix_t;
 
 /* ------------------------------------------------------------------ */
@@ -468,6 +489,46 @@ static void asix_report_link(asix_t *asix, bool up)
     }
 }
 
+/*
+ * Put an IN transfer back, or find out why it cannot go.
+ *
+ * THIS USED TO BE AN UNCONDITIONAL RESUBMIT, and that is what killed
+ * receive on the board. rx_cb logged a failed transfer at DEBUG and
+ * resubmitted it; but a failed transfer has already halted the
+ * endpoint, so the resubmit failed ("Enqueue URB error:
+ * ESP_ERR_INVALID_STATE", once per RX transfer), its return was not
+ * looked at, and after the second one nothing was queued on the IN
+ * endpoint at all. Link up, a link-local IPv6 address -- which needs no
+ * reply -- and no DHCP lease, ever.
+ *
+ * Now: CANCELED is ours (a stop, an unplug, a recovery) and is left
+ * alone. Any other failure, or a submit that fails, posts one recovery
+ * to the worker and leaves the transfer idle for it to restart.
+ */
+static void asix_resubmit_in(asix_t *asix, usb_transfer_t *xfer)
+{
+    if (!(asix->running && asix->attached && asix->started) || asix->recovering) {
+        return;
+    }
+    if (xfer->status == USB_TRANSFER_STATUS_CANCELED) {
+        return;
+    }
+    esp_err_t err = ESP_OK;
+    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
+        err = usb_host_transfer_submit(xfer);
+        if (err == ESP_OK) {
+            return;
+        }
+    }
+    asix->recovering = true;
+    const asix_cmd_t cmd = { .type = ASIX_CMD_RECOVER };
+    if (xQueueSend(asix->cmd_queue, &cmd, 0) != pdTRUE) {
+        asix->recovering = false;   /* try again on the next failure */
+    }
+    ESP_LOGW(TAG, "ep 0x%02x: transfer status %d, submit %s; recovering",
+             xfer->bEndpointAddress, (int)xfer->status, esp_err_to_name(err));
+}
+
 /* Interrupt endpoint: the chip reports PHY link state here. Byte 2
  * bit 0 is the link bit for the primary PHY. The transfer is resubmitted
  * from its own callback; the device NAKs until its polling interval has
@@ -494,9 +555,7 @@ static void int_cb(usb_transfer_t *xfer)
         }
     }
 
-    if (asix->running && asix->attached && asix->started) {
-        usb_host_transfer_submit(xfer);
-    }
+    asix_resubmit_in(asix, xfer);
 }
 
 /* Hand one received frame to the stack.
@@ -538,10 +597,7 @@ static void rx_cb(usb_transfer_t *xfer)
     asix_t *asix = (asix_t *)xfer->context;
 
     if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-        if (xfer->status != USB_TRANSFER_STATUS_CANCELED) {
-            ESP_LOGD(TAG, "rx transfer status %d", xfer->status);
-        }
-        goto resubmit;
+        goto resubmit;          /* asix_resubmit_in() sorts out which */
     }
 
     int remaining = xfer->actual_num_bytes;
@@ -572,9 +628,7 @@ static void rx_cb(usb_transfer_t *xfer)
     }
 
 resubmit:
-    if (asix->running && asix->attached && asix->started) {
-        usb_host_transfer_submit(xfer);
-    }
+    asix_resubmit_in(asix, xfer);
 }
 
 static void tx_cb(usb_transfer_t *xfer)
@@ -778,11 +832,15 @@ static esp_err_t asix_find_endpoints(asix_t *asix)
 
 static esp_err_t asix_start_rx(asix_t *asix)
 {
-    /* stop() halts these endpoints; a halted endpoint refuses new
-     * transfers until cleared. Harmless on a fresh device. */
-    usb_host_endpoint_clear(asix->dev, asix->ep_in);
-    if (asix->ep_int) {
-        usb_host_endpoint_clear(asix->dev, asix->ep_int);
+    /* stop() and a recovery halt these endpoints; a halted endpoint
+     * refuses new transfers until cleared. NOT on a fresh device: a
+     * clear there fails, and logged two errors at every bring-up. */
+    if (asix->halted) {
+        usb_host_endpoint_clear(asix->dev, asix->ep_in);
+        if (asix->ep_int) {
+            usb_host_endpoint_clear(asix->dev, asix->ep_int);
+        }
+        asix->halted = false;
     }
 
     for (int i = 0; i < ASIX_RX_XFER_COUNT; i++) {
@@ -837,6 +895,9 @@ static esp_err_t asix_open_device(asix_t *asix, uint8_t addr)
     asix->dev = dev;
     asix->dev_addr = addr;
     asix->attached = true;      /* asix_ctrl() needs this set */
+    asix->halted = false;       /* a fresh device's endpoints are not */
+    asix->recovering = false;
+    asix->recoveries = 0;
 
     ESP_GOTO_ON_ERROR(asix_find_endpoints(asix), detach, TAG, "endpoints");
     ESP_GOTO_ON_ERROR(usb_host_interface_claim(asix->client, dev, asix->itf_num, 0),
@@ -978,6 +1039,41 @@ static void event_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/*
+ * Restart every IN transfer after one failed. Both IN endpoints, not
+ * only the one that failed: which one it was is not carried in the
+ * command, and restarting a healthy interrupt endpoint costs one poll.
+ *
+ * Halt, flush, and wait for the cancellations to come back -- the same
+ * 50 ms asix_close_device() waits, for the same reason -- then clear
+ * and resubmit through asix_start_rx(), exactly as a start does.
+ */
+static void asix_recover_in(asix_t *asix)
+{
+    if (!(asix->attached && asix->started)) {
+        asix->recovering = false;
+        return;
+    }
+    usb_host_endpoint_halt(asix->dev, asix->ep_in);
+    usb_host_endpoint_flush(asix->dev, asix->ep_in);
+    if (asix->ep_int) {
+        usb_host_endpoint_halt(asix->dev, asix->ep_int);
+        usb_host_endpoint_flush(asix->dev, asix->ep_int);
+    }
+    asix->halted = true;
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    asix->recovering = false;
+    const esp_err_t err = asix_start_rx(asix);
+    asix->recoveries++;
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "receive restarted (%" PRIu32 " time%s since plug-in)",
+                 asix->recoveries, asix->recoveries == 1 ? "" : "s");
+    } else {
+        ESP_LOGE(TAG, "receive could not be restarted: %s", esp_err_to_name(err));
+    }
+}
+
 static void worker_task(void *arg)
 {
     asix_t *asix = (asix_t *)arg;
@@ -1005,6 +1101,9 @@ static void worker_task(void *arg)
             if (asix->attached && asix->started) {
                 asix_report_link(asix, cmd.link_up);
             }
+            break;
+        case ASIX_CMD_RECOVER:
+            asix_recover_in(asix);
             break;
         }
     }
@@ -1127,6 +1226,7 @@ static esp_err_t asix_stop(iot_eth_driver_t *driver)
             usb_host_endpoint_halt(asix->dev, asix->ep_int);
             usb_host_endpoint_flush(asix->dev, asix->ep_int);
         }
+        asix->halted = true;
     }
 
     return ESP_OK;
