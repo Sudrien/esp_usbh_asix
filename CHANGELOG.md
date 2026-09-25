@@ -2,6 +2,21 @@
 
 ## v0.1.0 - unreleased
 
+- **Second round of board runs** at `5843b0c` (AX88772A, M5Stack Tab5,
+  IDF v5.5.5, in m5tab5_defeatist_music_player): multi-minute TLS
+  streams, the USB host shared with CDC-ECM, MSC, UAC and HID class
+  drivers, and adapter unplug mid-stream. Two log lines seen there are
+  cosmetic:
+  - `E asix: bring-up failed: ESP_ERR_INVALID_STATE` whenever another
+    device (a flash drive, 13fe:6700) enumerates while an adapter is
+    attached. asix_open_device() refuses a second device with
+    ESP_ERR_INVALID_STATE ("one adapter at a time") before looking at
+    its IDs, and the worker logs anything but ESP_ERR_NOT_FOUND as an
+    error. The adapter kept working. Not yet fixed.
+  - `E asix: asix_start_rx(958): int submit` and "receive could not be
+    restarted" when the adapter is pulled out: a recovery racing the
+    removal. "adapter removed" follows and a replug works.
+
 - **First hardware run** (AX88772A, `0b95:772a`, on an M5Stack Tab5 /
   ESP32-P4, IDF v5.5.5): enumerates, reads the MAC, links, gets a DHCP
   lease and carried a 512 kbit/s internet radio stream for minutes.

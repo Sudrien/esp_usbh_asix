@@ -15,6 +15,20 @@ ESP32-P4 (M5Stack Tab5, ESP-IDF v5.5.5): DHCP, a TLS audio stream for
 minutes, cable unplug and replug. The other two chips have still not
 been tried.
 
+Tested at `5843b0c`, in [m5tab5_defeatist_music_player](https://github.com/Sudrien/m5tab5_defeatist_music_player)
+on ESP-IDF v5.5.5, chip code `0x10`, internal PHY:
+
+- DHCP and the default route; a TLS internet radio stream over the
+  cable for about three and a half minutes, 35 ms of stall in total.
+- Sharing the one USB host with `espressif/iot_usbh_ecm`, the USB mass
+  storage and audio class drivers and a HID remote. A flash drive
+  plugged in beside the adapter mounted, and the stream carried on.
+- Pulling the adapter out mid-stream: link down, then adapter removed.
+- Two things in the log that are noise, not faults (see the changelog):
+  "bring-up failed: ESP_ERR_INVALID_STATE" when any other device
+  enumerates while an adapter is attached, and "asix_start_rx ... int
+  submit" when the adapter is pulled out.
+
 | Chip     | VID:PID     | Chip code | Status |
 |----------|-------------|-----------|--------|
 | AX88772  | `0b95:7720` | `0x00`    | untested |
